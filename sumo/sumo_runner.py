@@ -2,15 +2,20 @@
 SUMO 1.27.1 Microscopic Simulation & TraCI Controller.
 
 Manages Eclipse SUMO process lifecycle, TraCI socket connection,
-real-time edge detector feature extraction, and adaptive signal timing control.
+real-time vehicle telemetry, and live rerouting detection via TraCI.
+
+This module wraps sitabuldi_sim.py's real TraCI simulation and exposes
+a consistent interface for the backend API.
 """
 
 import os
 import sys
-import time
+import json
+import math
 from typing import Dict, Any, Optional
 
 DEFAULT_SUMO_HOME = r"C:\Program Files (x86)\Eclipse\Sumo"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def setup_sumo_env() -> str:
     sumo_home = os.getenv("SUMO_HOME", DEFAULT_SUMO_HOME)
@@ -30,8 +35,16 @@ def is_sumo_available() -> bool:
     except ImportError:
         return False
 
+
 class SUMOLiveRunner:
-    """Live TraCI simulation execution runner for SUMO 1.27.1."""
+    """
+    Live TraCI simulation execution runner for SUMO 1.27.1.
+
+    Delegates to sitabuldi_sim.py for the actual TraCI simulation loop.
+    The run_simulation() method triggers a real SUMO process via TraCI,
+    steps it forward in time, collects vehicle telemetry, detects reroute
+    events, and writes sim_output.json — no formula-based estimates.
+    """
 
     def __init__(self, sumo_home: Optional[str] = None):
         self.sumo_home = sumo_home or setup_sumo_env()
@@ -50,64 +63,74 @@ class SUMOLiveRunner:
 
     def run_simulation(
         self,
-        time_window: str = "morning",
-        scenario: str = "proposed",
-        demand_multiplier: float = 1.0,
-        lane_closure: bool = False,
-        steps_count: int = 36
+        net_file: Optional[str] = None,
+        demand_file: Optional[str] = None,
+        sim_steps: int = 800,
+        rerouting_probability: float = 1.0,
+        rerouting_period: int = 20,
     ) -> Dict[str, Any]:
-        """Runs microscopic TraCI simulation loop or simulates micro-steps if network binary is detached."""
-        if not self.is_connected:
-            self.connect()
+        """
+        Run a real SUMO/TraCI microscopic simulation.
 
-        # Calibration parameters for peak windows
-        base_demand = 950 * demand_multiplier
-        if lane_closure:
-            base_demand *= 1.2
+        Calls traci.start() with the provided network and demand files,
+        steps the simulation via traci.simulationStep(), records per-step
+        vehicle telemetry (position, speed, edge), detects reroute events
+        (SUMO rerouting device reassignments + edge-sequence deviations),
+        writes sim_output.json, and returns a summary dict.
 
-        # Detailed step records
-        records = []
-        for step in range(steps_count):
-            minute = step * 5
-            # Simulating microscopic TraCI step feedback
-            vol = base_demand * (0.6 + 0.4 * (1.0 - abs((step - 18) / 18.0)))
-            if scenario == "proposed":
-                delay = max(15.0, 52.0 * (vol / 1200.0) * 0.65)
-                queue = max(10.0, 91.0 * (vol / 1200.0) * 0.65)
-                throughput = min(1600.0, vol * 1.2)
-                cls = "MODERATE" if vol > 1000 else "LOW"
-            else:
-                delay = max(25.0, 85.0 * (vol / 1200.0))
-                queue = max(20.0, 140.0 * (vol / 1200.0))
-                throughput = min(1250.0, vol * 0.95)
-                cls = "HIGH" if vol > 900 else "MODERATE"
+        Parameters
+        ----------
+        net_file   : path to .net.xml (defaults to sitabuldi_junction.net.xml)
+        demand_file: path to .rou.xml  (defaults to sitabuldi_demand.rou.xml)
+        sim_steps  : number of simulation steps (1 step = 1 second)
+        rerouting_probability : fraction of vehicles equipped with rerouting device
+        rerouting_period      : how often (seconds) rerouting device re-evaluates route
 
-            records.append({
-                "minute": minute,
-                "volume": round(vol, 1),
-                "avgDelaySec": round(delay, 1),
-                "queueMeters": round(queue, 1),
-                "throughputVehHr": round(throughput, 1),
-                "congestionClass": cls
-            })
+        Returns
+        -------
+        dict with keys: steps_run, total_vehicles, reroute_event_count,
+                        frame_count, output_file, engine
+        """
+        from sitabuldi_sim import run_simulation as _run_sim, SIM_STEPS, REROUTING_PROBABILITY, REROUTING_PERIOD
 
-        avg_delay = round(sum(r["avgDelaySec"] for r in records) / len(records), 1)
-        avg_queue = round(sum(r["queueMeters"] for r in records) / len(records), 1)
-        avg_tp = round(sum(r["throughputVehHr"] for r in records) / len(records), 1)
+        # Allow caller to override module-level constants via monkey-patching
+        import sitabuldi_sim as _sim_mod
+        _sim_mod.SIM_STEPS             = sim_steps
+        _sim_mod.REROUTING_PROBABILITY = rerouting_probability
+        _sim_mod.REROUTING_PERIOD      = rerouting_period
+        if net_file:
+            _sim_mod.NET_FILE = net_file
+        if demand_file:
+            _sim_mod.DEMAND_FILE = demand_file
+
+        output = _run_sim()
+        meta = output.get("meta", {})
 
         return {
-            "engine": "SUMO 1.27.1 TraCI",
-            "time_window": time_window,
-            "scenario": scenario,
-            "avgDelay": avg_delay,
-            "queueLength": avg_queue,
-            "throughput": avg_tp,
-            "travelTime": round(avg_delay / 6.0 + 5.0, 1),
-            "congestionClass": "HIGH" if scenario == "baseline" else "MODERATE",
-            "records": records
+            "engine":              "SUMO 1.27.1 TraCI",
+            "steps_run":           meta.get("steps_run", 0),
+            "total_vehicles":      meta.get("total_vehicles", 0),
+            "reroute_event_count": meta.get("reroute_event_count", 0),
+            "frame_count":         len(output.get("frames", [])),
+            "edge_count":          len(output.get("edges", [])),
+            "output_file":         os.path.join(SCRIPT_DIR, "sim_output.json"),
+            "junction_id":         meta.get("junction_id"),
+            "junction_lon":        meta.get("junction_lon"),
+            "junction_lat":        meta.get("junction_lat"),
         }
 
+    def load_last_output(self) -> Dict[str, Any]:
+        """Load and return the most recent sim_output.json from disk."""
+        output_file = os.path.join(SCRIPT_DIR, "sim_output.json")
+        if not os.path.exists(output_file):
+            raise FileNotFoundError(
+                f"sim_output.json not found. Run run_simulation() first."
+            )
+        with open(output_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def close(self):
+        """Close TraCI connection if open (sitabuldi_sim closes it internally)."""
         if self.traci and self.is_connected:
             try:
                 self.traci.close()
