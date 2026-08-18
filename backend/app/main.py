@@ -1,12 +1,13 @@
 import asyncio
 import json
+import math
 import os
 import sys
 import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 # Add project root, backend, and app directories to sys.path
@@ -338,3 +339,103 @@ def analytics(time_window: str = "morning", corridor: str = "corridor-a",
         "baseline": base_data,
         "proposed": prop_data,
     }
+
+
+@app.get("/api/sumo/sim-data")
+def sumo_sim_data():
+    """
+    Serves the real SUMO/TraCI simulation output (sim_output_clean.json).
+    Contains:
+      - edges:         294 network edge geometries (lon/lat coords)
+      - frames:        ~18,857 per-step per-vehicle telemetry records
+      - reroute_events: 9 genuine reroute events (vehicles that actually changed edge)
+      - meta:          simulation metadata (steps, vehicles, junction coordinates)
+    """
+    sumo_dir = os.path.abspath(os.path.join(current_dir, "..", "..", "sumo"))
+    sim_file = os.path.join(sumo_dir, "sim_output_clean.json")
+    if not os.path.exists(sim_file):
+        raise HTTPException(
+            status_code=404,
+            detail=f"sim_output_clean.json not found. Run sitabuldi_sim.py + clean_output.py first."
+        )
+    with open(sim_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+@app.get("/api/sumo/video-detections")
+def video_detections():
+    """
+    Serves the YOLOv8 + ByteTrack vehicle detection output (video_detections.json).
+    Contains per-frame detection data: timestamp_sec, vehicle_count, bboxes, track_ids.
+    """
+    ml_dir = os.path.abspath(os.path.join(current_dir, "..", "..", "ml"))
+    det_file = os.path.join(ml_dir, "video_detections.json")
+    if not os.path.exists(det_file):
+        raise HTTPException(
+            status_code=404,
+            detail="video_detections.json not found. Run ml/video_detect.py first."
+        )
+    with open(det_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+@app.get("/api/sumo/video-stream")
+async def video_stream(request: Request):
+    """
+    Streams the traffic video file with HTTP Range support for HTML5 <video> seeking.
+    The video path is configured here — update VIDEO_FILE_PATH if needed.
+    """
+    VIDEO_FILE_PATH = r"D:\All Download files\istockphoto-1173077963-640_adpp_is.mp4"
+
+    if not os.path.exists(VIDEO_FILE_PATH):
+        raise HTTPException(status_code=404, detail=f"Video file not found: {VIDEO_FILE_PATH}")
+
+    file_size = os.path.getsize(VIDEO_FILE_PATH)
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse Range: bytes=start-end
+        range_val = range_header.replace("bytes=", "").strip()
+        parts     = range_val.split("-")
+        start     = int(parts[0]) if parts[0] else 0
+        end       = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+        end       = min(end, file_size - 1)
+        chunk_len = end - start + 1
+
+        async def file_gen():
+            with open(VIDEO_FILE_PATH, "rb") as f:
+                f.seek(start)
+                remaining = chunk_len
+                while remaining > 0:
+                    buf = f.read(min(65536, remaining))
+                    if not buf:
+                        break
+                    remaining -= len(buf)
+                    yield buf
+
+        headers = {
+            "Content-Range":  f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges":  "bytes",
+            "Content-Length": str(chunk_len),
+            "Content-Type":   "video/mp4",
+        }
+        return StreamingResponse(file_gen(), status_code=206, headers=headers)
+
+    # No Range header — serve full file
+    async def full_gen():
+        with open(VIDEO_FILE_PATH, "rb") as f:
+            while True:
+                buf = f.read(65536)
+                if not buf:
+                    break
+                yield buf
+
+    return StreamingResponse(
+        full_gen(),
+        media_type="video/mp4",
+        headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"}
+    )
+
+
